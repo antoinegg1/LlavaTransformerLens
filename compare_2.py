@@ -39,6 +39,7 @@ def load_models_and_processor(model_path):
         fold_ln=False,
         center_writing_weights=False,
         center_unembed=False,
+        do_sample=False,
         tokenizer=None,
         dtype=torch.float32,
     )

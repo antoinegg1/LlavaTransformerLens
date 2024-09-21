@@ -771,11 +771,11 @@ class HookedLlava(HookedRootModule):
     
     def VL_to_embed(
         self,
-        input: Union[str, List[str], Int[torch.Tensor, "batch pos"]],
+        input_ids: Union[str, List[str], Int[torch.Tensor, "batch pos"]],
         prepend_bos: Optional[Union[bool, None]] = USE_DEFAULT_VALUE,
         padding_side: Optional[Union[Literal["left", "right"], None]] = USE_DEFAULT_VALUE,
         attention_mask: Optional[torch.Tensor] = None,
-        # past_kv_cache: Optional[HookedTransformerKeyValueCache] = None,
+        past_kv_cache: Optional[HookedTransformerKeyValueCache] = None,
         pixel_values:torch.Tensor = None,
         image_sizes:torch.Tensor = None,
     ) -> Tuple[
@@ -785,18 +785,17 @@ class HookedLlava(HookedRootModule):
         Optional[torch.Tensor],  # attention_mask [batch pos]
     ]:
       
-        position_ids=torch.arange(0, input.size(1), dtype=torch.long, device=input.device).unsqueeze(0)
-        tokens = input
-        if len(tokens.shape) == 1:
-            # If tokens are a rank 1 tensor, add a dummy batch dimension to avoid things breaking.
-            tokens = tokens[None]
-        if tokens.device.type != self.cfg.device:
-            tokens = tokens.to(devices.get_device_for_block_index(0, self.cfg))
+        position_ids=torch.arange(0, input_ids.size(1), dtype=torch.long, device=input_ids.device).unsqueeze(0)
+        if len(input_ids.shape) == 1:
+            # If input_ids are a rank 1 tensor, add a dummy batch dimension to avoid things breaking.
+            input_ids = input_ids[None]
+        if input_ids.device.type != self.cfg.device:
+            input_ids = input_ids.to(devices.get_device_for_block_index(0, self.cfg))
 
         if attention_mask is not None:
-            assert attention_mask.shape == tokens.shape, (
-                f"Attention mask shape {attention_mask.shape} does not match tokens shape "
-                f"{tokens.shape}"
+            assert attention_mask.shape == input_ids.shape, (
+                f"Attention mask shape {attention_mask.shape} does not match input_ids shape "
+                f"{input_ids.shape}"
             )
             attention_mask = attention_mask.to(devices.get_device_for_block_index(0, self.cfg))
         # elif (
@@ -804,11 +803,11 @@ class HookedLlava(HookedRootModule):
         # ) or past_kv_cache is not None:
         #     # If the padding side is left or we are using caching, we need to compute the attention
         #     # mask for the adjustment of absolute positional embeddings and attention masking so
-        #     # that pad tokens are not attended.
+        #     # that pad input_ids are not attended.
 
         #     if prepend_bos is USE_DEFAULT_VALUE:
         #         prepend_bos = self.cfg.default_prepend_bos
-        #     attention_mask = utils.get_attention_mask(self.tokenizer, tokens, prepend_bos)
+        #     attention_mask = utils.get_attention_mask(self.tokenizer, input_ids, prepend_bos)
 
             # if past_kv_cache is not None:
             #     # past_kv_cache is not None, so we're doing caching.
@@ -828,7 +827,7 @@ class HookedLlava(HookedRootModule):
         # if past_kv_cache is None:
         #     pos_offset = 0
         # else:
-        #     batch_size, ctx_length = tokens.shape
+        #     batch_size, ctx_length = input_ids.shape
         #     (
         #         cached_batch_size,
         #         cache_ctx_length,
@@ -844,11 +843,11 @@ class HookedLlava(HookedRootModule):
         #     pos_offset = cache_ctx_length
         pos_offset = 0
         if self.cfg.use_hook_tokens:
-            tokens = self.hook_tokens(tokens)
-        embed = self.hook_embed(self.embed(tokens))  # [batch, pos, d_model]
+            input_ids = self.hook_tokens(input_ids)
+        embed = self.hook_embed(self.embed(input_ids))  # [batch, pos, d_model]
         if self.cfg.positional_embedding_type == "standard":
             pos_embed = self.hook_pos_embed(
-                self.pos_embed(tokens, pos_offset, attention_mask)
+                self.pos_embed(input_ids, pos_offset, attention_mask)
             )  # [batch, pos, d_model]
             residual = embed + pos_embed  # [batch, pos, d_model]
             shortformer_pos_embed = None
@@ -856,7 +855,7 @@ class HookedLlava(HookedRootModule):
             # If we're using shortformer style attention, we don't add the positional embedding to
             # the residual stream. See HookedTransformerConfig for details
             pos_embed = self.hook_pos_embed(
-                self.pos_embed(tokens, pos_offset, attention_mask)
+                self.pos_embed(input_ids, pos_offset, attention_mask)
             )  # [batch, pos, d_model]
             residual = embed
             shortformer_pos_embed = pos_embed
@@ -891,10 +890,10 @@ class HookedLlava(HookedRootModule):
         '''
         #-------------#
 
-            # if the number of image tokens is more than image embeddings seq length, then prob we expanded it in processing
+            # if the number of image input_ids is more than image embeddings seq length, then prob we expanded it in processing
             # not very reliable, but we don't expect one to actually pass 500+ images for one prompt
             # In case we're in decoding stage, legacy behavior is checked by presence of pixel values even if use_cache=True
-        if pixel_values is not None and tokens.shape[1] != 1 and pixel_values.size(0) > 0:
+        if pixel_values is not None and input_ids.shape[1] != 1 and pixel_values.size(0) > 0:
             # ! infer image_num_patches from image_sizes
             image_num_patches = [
                 image_size_to_num_patches(
@@ -941,7 +940,7 @@ class HookedLlava(HookedRootModule):
                     image_features,
                     feature_lens,
                     inputs_embeds,
-                    tokens,
+                    input_ids,
                     attention_mask,
                     position_ids,
                 )
@@ -950,8 +949,42 @@ class HookedLlava(HookedRootModule):
             # )
             # image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
             # inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, image_features)
+        elif past_kv_cache is not None and pixel_values is not None and input_ids.shape[1] == 1:
+                # Retrieve the first layer to inspect the logits and mask out the hidden states
+                # that are set to 0
+                first_layer_past_key_value = past_kv_cache[0][0][:, :, :, 0]
+
+                # Sum all dimensions of head_dim (-2) to avoid random errors such as: https://github.com/huggingface/transformers/pull/28032#issuecomment-1863691941
+                batch_index, non_attended_tokens = torch.where(first_layer_past_key_value.float().sum(-2) == 0)
+
+                # Get the target length
+                target_length = input_ids.shape[1]
+                past_length = first_layer_past_key_value.shape[-1]
+
+                extended_attention_mask = torch.ones(
+                    (attention_mask.shape[0], past_length),
+                    dtype=attention_mask.dtype,
+                    device=attention_mask.device,
+                )
+
+                # Filter out only the tokens that can be un-attended, this can happen
+                # if one uses Llava + Fused modules where the cache on the
+                # first iteration is already big enough, or if one passes custom cache
+                valid_indices = non_attended_tokens < extended_attention_mask.size(-1)
+                new_batch_index = batch_index[valid_indices]
+                new_non_attended_tokens = non_attended_tokens[valid_indices]
+
+                # Zero-out the places where we don't need to attend
+                extended_attention_mask[new_batch_index, new_non_attended_tokens] = 0
+
+                attention_mask = torch.cat((extended_attention_mask, attention_mask[:, -target_length:]), dim=1)
+
+                position_ids = torch.sum(attention_mask, dim=1).unsqueeze(-1) - 1
         
         return inputs_embeds, input_ids, position_ids, attention_mask
+    
+    
+
     
     @overload
     def forward(
@@ -1047,17 +1080,7 @@ class HookedLlava(HookedRootModule):
             inputs_embeds.size()[:2], dtype=torch.long, device=inputs_embeds.device
         ) 
         if position_ids is None:
-            seq_length = inputs_embeds.size(1)
-            if past_kv_cache is not None:
-                # Adjust position_ids based on the length of past_key_values
-                past_length = past_kv_cache.seq_len
-                position_ids = torch.arange(
-                    past_length, past_length + seq_length, dtype=torch.long, device=inputs_embeds.device
-                ).unsqueeze(0).expand(inputs_embeds.size(0), -1)  # [batch, seq_len]
-            else:
-                position_ids = torch.arange(
-                    seq_length, dtype=torch.long, device=inputs_embeds.device
-                ).unsqueeze(0).expand(inputs_embeds.size(0), -1)  # [batch, seq_len]
+            position_ids = torch.arange(0, inputs_embeds.size(1), dtype=torch.long, device=inputs_embeds.device).unsqueeze(0)
 
         if start_at_layer is None:
             start_at_layer = 0
@@ -2461,7 +2484,7 @@ class HookedLlava(HookedRootModule):
         use_past_kv_cache: bool = True,
         prepend_bos: Optional[bool] = USE_DEFAULT_VALUE,
         padding_side: Optional[Literal["left", "right"]] = USE_DEFAULT_VALUE,
-        return_type: Optional[str] = "input",
+        return_type: Optional[str] = "str",
         verbose: bool = True,
     ) -> Union[Int[torch.Tensor, "batch pos_plus_new_tokens"], str]:
         
@@ -2542,7 +2565,7 @@ class HookedLlava(HookedRootModule):
 
             generated_tokens = input_ids.clone()
             if use_past_kv_cache:
-                logits = self.forward(
+                logits,past_kv_cache = self.forward(
                     inputs_embeds=inputs_embeds,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
@@ -2550,6 +2573,7 @@ class HookedLlava(HookedRootModule):
                     return_type="logits",
                 )
             else:
+                logging.warning("past_kv_cache is not used in generate")
                 logits = self.forward(
                     inputs_embeds=inputs_embeds,
                     attention_mask=attention_mask,
@@ -2557,7 +2581,7 @@ class HookedLlava(HookedRootModule):
                     return_type="logits",
                 )
             
-            
+            input_length=input_ids.shape[1]
             
             
             for _ in tqdm.tqdm(range(max_new_tokens), disable=not verbose):
@@ -2589,30 +2613,33 @@ class HookedLlava(HookedRootModule):
                 generated_tokens = torch.cat([generated_tokens, next_tokens.unsqueeze(-1)], dim=-1)
 
                 attention_mask = torch.cat(
-                    [attention_mask, attention_mask.new_ones((batch_size, 1))], dim=1
+                    [attention_mask, attention_mask.new_ones((batch_size, 1), device=device)], dim=1
                 )
                 position_ids = torch.cat([position_ids, position_ids[:, -1:] + 1], dim=1)
 
-                new_inputs_embeds, _, _, _ = self.input_to_embed(
-                    next_tokens.unsqueeze(1),  # Add sequence length dimension
-                    attention_mask=attention_mask[:, -1:],
-                    past_kv_cache=past_kv_cache,
+
+                new_input_ids = next_tokens.unsqueeze(-1)  # Shape: [batch_size, 1]
+                new_inputs_embeds, _, _, _ = self.VL_to_embed(
+                    new_input_ids,
+                    prepend_bos=False,  # 不需要再添加 BOS，因为这是新生成的 token
+                    pixel_values=pixel_values,
+                    image_sizes=image_sizes,
+                    attention_mask=attention_mask[:, -1:],  # 只需对应新 token 的 attention_mask
                 )
-                # No need to compute position embeddings here
-                inputs_embeds = torch.cat([inputs_embeds, new_inputs_embeds], dim=1)
 
 
 
                 # 前向传播，处理新生成的 token
                 if use_past_kv_cache:
-                    logits = self.forward(
+                    logits, past_kv_cache = self.forward(
                         inputs_embeds=new_inputs_embeds,
                         attention_mask=attention_mask,
-                        position_ids=position_ids[:, -1:],  # Pass only the new position_id
+                        position_ids=position_ids[:, -1:],  # 只传入新位置
                         past_kv_cache=past_kv_cache,
                         return_type="logits",
                     )
                 else:
+                    logging.warning("past_kv_cache is not used in generate")
                     inputs_embeds_full, _, _, _ = self.input_to_embed(
                         generated_tokens,
                         attention_mask=attention_mask,
@@ -2625,15 +2652,9 @@ class HookedLlava(HookedRootModule):
                         return_type="logits",
                     )
 
-            # 返回生成的序列
-            if return_type == "str":
-                outputs = []
-                for seq in generated_tokens:
-                    text = self.tokenizer.decode(seq, skip_special_tokens=True)
-                    outputs.append(text)
-                return outputs
-            else:
-                return generated_tokens
+            output=generated_tokens[:, input_length:]
+            
+            return output
 
     # Give access to all weights as properties.
     @property
@@ -2908,3 +2929,98 @@ class HookedLlava(HookedRootModule):
                 padding_side=padding_side,
                 truncate=True,
             )
+    
+    @torch.inference_mode()
+    def get_embedding(
+        self,
+        inputs: dict[str, torch.Tensor] = None,
+        max_new_tokens: int = 100,
+        stop_at_eos: bool = True,
+        eos_token_id: Optional[int] = None,
+        do_sample: bool = True,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
+        temperature: float = 1.0,
+        freq_penalty: float = 0.0,
+        use_past_kv_cache: bool = True,
+        prepend_bos: Optional[bool] = USE_DEFAULT_VALUE,
+        padding_side: Optional[Literal["left", "right"]] = USE_DEFAULT_VALUE,
+        return_type: Optional[str] = "str",
+        verbose: bool = True,
+    ) -> Union[Int[torch.Tensor, "batch pos_plus_new_tokens"], str]:
+        
+        with utils.LocallyOverridenDefaults(
+            self, prepend_bos=prepend_bos, padding_side=padding_side
+        ):
+            input_ids=inputs["input_ids"]
+
+            attention_mask = inputs.get("attention_mask", None)
+            pixel_values = inputs.get("pixel_values", None)
+            image_sizes = inputs.get("image_sizes", None)
+            vision = pixel_values is not None
+            
+            # if return_type == "input":
+            #     if type(input) == str:
+            #         return_type = "str"
+            #     else:
+            #         return_type = "tensor"
+            # return_type = "str"
+            
+            assert isinstance(input_ids, torch.Tensor)
+            batch_size, ctx_length = input_ids.shape
+            device = devices.get_device_for_block_index(0, self.cfg)
+            input_ids = input_ids.to(device)
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(device)
+            if vision:
+                pixel_values = pixel_values.to(device)
+                if image_sizes is not None:
+                    image_sizes = image_sizes.to(device)
+            
+            if use_past_kv_cache:
+                past_kv_cache = HookedTransformerKeyValueCache.init_cache(
+                    self.cfg, self.cfg.device, batch_size
+                )
+            else:
+                past_kv_cache = None
+
+            stop_tokens: list[int] = []
+            eos_token_for_padding = 0
+            assert self.tokenizer is not None
+            if stop_at_eos:
+                tokenizer_has_eos_token = (
+                    self.tokenizer is not None and self.tokenizer.eos_token_id is not None
+                )
+                if eos_token_id is None:
+                    assert (
+                        tokenizer_has_eos_token
+                    ), "Must pass a eos_token_id if stop_at_eos is True and tokenizer is None or has no eos_token_id"
+
+                    eos_token_id = self.tokenizer.eos_token_id
+
+                if isinstance(eos_token_id, int):
+                    stop_tokens = [eos_token_id]
+                    eos_token_for_padding = eos_token_id
+                else:
+                    # eos_token_id is a Sequence (e.g. list or tuple)
+                    stop_tokens = eos_token_id
+                    eos_token_for_padding = (
+                        self.tokenizer.eos_token_id if tokenizer_has_eos_token else eos_token_id[0]
+                    )
+
+            # An array to track which sequences in the batch have finished.
+            finished_sequences = torch.zeros(batch_size, dtype=torch.bool, device=self.cfg.device)
+            # pdb.set_trace()
+            # Currently nothing in HookedTransformer changes with eval, but this is here in case
+            # that changes in the future.
+            self.eval()
+            inputs_embeds, input_ids, position_ids, attention_mask = self.VL_to_embed(
+                        input_ids,
+                        prepend_bos=prepend_bos,
+                        padding_side=padding_side,
+                        # past_kv_cache=past_kv_cache,
+                        pixel_values=pixel_values,
+                        image_sizes=image_sizes,
+                        attention_mask=attention_mask,
+            )
+        return inputs_embeds, input_ids, position_ids, attention_mask

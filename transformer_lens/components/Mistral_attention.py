@@ -270,21 +270,27 @@ class MistralAttention(AbstractAttention):
         v = self.hook_v(attn_fn(hidden_states, self.W_V, self.b_V))
         # import pdb
         # pdb.set_trace()
-        
+        q=q.transpose(1, 2).contiguous()
+        k=k.transpose(1, 2).contiguous()
+        v=v.transpose(1, 2).contiguous()
+        cos, sin = self.rotary_emb(v, position_ids)
+        q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
         
         if past_key_value is not None:
         # Append new keys and values to the cache and update the cache
             kv_cache_pos_offset = past_key_value.past_keys.size(1)
-            updated_keys, updated_values = past_key_value.append(k, v)
+            updated_keys, updated_values = past_key_value.append(k.transpose(1, 2).contiguous(), v.transpose(1, 2).contiguous())
+            updated_keys = updated_keys.transpose(1, 2).contiguous()
+            updated_values = updated_values.transpose(1, 2).contiguous()
         else:
-            kv_cache_pos_offset = 0
             # Initialize past_key_value
             past_key_value = HookedTransformerKeyValueCacheEntry(
-                past_keys=k,
-                past_values=v,
+                past_keys=k.transpose(1, 2).contiguous(),
+                past_values=v.transpose(1, 2).contiguous(),
                 frozen=False
             )
             updated_keys, updated_values = k, v
+            kv_cache_pos_offset = 0
             
         k = updated_keys
         v = updated_values
@@ -296,18 +302,7 @@ class MistralAttention(AbstractAttention):
         # q = einops.rearrange(
         #     q, "batch query_pos head_index d_head -> batch head_index query_pos d_head"
         # )
-        q=q.transpose(1, 2).contiguous()
-        k=k.transpose(1, 2).contiguous()
-        v=v.transpose(1, 2).contiguous()
-        if self.cfg.positional_embedding_type == "rotary":
-            if position_ids is None:
-                position_ids = torch.arange(
-                    kv_cache_pos_offset,
-                    kv_cache_pos_offset + hidden_states.size(1),
-                    device=hidden_states.device
-                ).unsqueeze(0)
-            cos, sin = self.rotary_emb(v, position_ids)
-            q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
+        
 
         if self.cfg.dtype not in [torch.float32, torch.float64]:
             # If using 16 bits, increase the precision to avoid numerical instabilities
@@ -324,9 +319,12 @@ class MistralAttention(AbstractAttention):
         # )
         attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.cfg.d_head)  # [batch, if attention_mask is not None:
             # Expand attention_mask to match attn_scores dimensions
-        if attention_mask is not None:
-            attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)  # [batch, 1, 1, seq_len_total]
-            attn_scores = attn_scores.masked_fill(attention_mask == 0, float('-inf'))
+        # if attention_mask is not None:
+        #     attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)  # [batch, 1, 1, seq_len_total]
+        #     attn_scores = attn_scores.masked_fill(attention_mask == 0, float('-inf'))
+        attn_scores = self.apply_causal_mask(
+                attn_scores, kv_cache_pos_offset, attention_mask
+            )
 
         # Apply hooks to attention scores
         attn_scores = self.hook_attn_scores(attn_scores)

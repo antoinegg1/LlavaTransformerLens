@@ -113,3 +113,6 @@ class HookedTransformerKeyValueCache:
 
     def __getitem__(self, idx):
         return self.entries[idx]
+
+    def seq_len(self):
+        return self.previous_attention_mask.size(1)

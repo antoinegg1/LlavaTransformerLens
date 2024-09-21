@@ -23,7 +23,8 @@ def load_models_and_processor(model_path):
     vision_model = LlavaNextForConditionalGeneration.from_pretrained(
         model_path, 
         torch_dtype=torch.float32, 
-        low_cpu_mem_usage=True
+        low_cpu_mem_usage=True,
+        do_sample=False,
     )
     print("Vision model loaded.")
     
@@ -44,7 +45,7 @@ def load_models_and_processor(model_path):
     # print(vision_model.language_model.state_dict().keys())
     # 将模型转移到GPU（如果可用）
     # hook_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    vision_device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+    vision_device = torch.device("cuda:4" if torch.cuda.is_available() else "cpu")
     # hook_language_model = hook_language_model.to(hook_device)
     vision_model = vision_model.to(vision_device)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
@@ -125,7 +126,7 @@ def process_image_and_generate_response(processor, vision_model, image_path):
     prompt = processor.apply_chat_template(conversation, add_generation_prompt=True)
     
     # 处理图像和文本输入
-    inputs = processor(images=image, text=prompt, return_tensors="pt").to("cuda:1")
+    inputs = processor(images=image, text=prompt, return_tensors="pt").to("cuda:4")
     
     return inputs
 
