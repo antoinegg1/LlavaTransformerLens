@@ -145,7 +145,6 @@ class MistralAttention(AbstractAttention):
         self.hook_attn_scores = HookPoint()  # [batch, head_index, query_pos, key_pos]
         self.hook_pattern = HookPoint()  # [batch, head_index, query_pos, key_pos]
         self.hook_result = HookPoint()  # [batch, pos, head_index, d_model]
-        
     # def apply_rotary(
     #     self,
     #     x: Float[torch.Tensor, "batch pos head_index d_head"],
@@ -253,18 +252,12 @@ class MistralAttention(AbstractAttention):
     
     def forward(
         self,
-        hidden_state,
-        past_kv_cache_entry: Optional[HookedTransformerKeyValueCacheEntry] = None,
-        additive_attention_mask: Optional[Float[torch.Tensor, "batch 1 1 kv_pos"]] = None,
-        attention_mask: Optional[Int[torch.Tensor, "batch offset_pos"]] = None,
-        position_bias: Optional[Float[torch.Tensor, "1 head_index pos kv_pos"]] = None,
-    ) -> Float[torch.Tensor, "batch pos d_model"]:
-        """
-        shortformer_pos_embed is only used if self.cfg.positional_embedding_type == "shortformer", else defaults to None and is irrelevant. See HookedTransformerConfig for more details
-        past_kv_cache_entry is an optional entry of past keys and values for this layer, only relevant if generating text. Defaults to None
-        additive_attention_mask is an optional mask to add to the attention weights. Defaults to None.
-        attention_mask is the attention mask for padded tokens. Defaults to None.
-        """
+        hidden_states: torch.Tensor,  # [batch, seq_len, d_model]
+        position_ids: Optional[torch.Tensor] = None,      # [batch, seq_len]
+        attention_mask: Optional[torch.Tensor] = None,    # [batch, seq_len]
+        past_key_value: Optional[HookedTransformerKeyValueCacheEntry] = None,  # Cache entry
+    ) -> torch.Tensor:
+
 
         attn_fn = (
             complex_attn_linear
@@ -272,20 +265,29 @@ class MistralAttention(AbstractAttention):
             else simple_attn_linear
         )
         
-        q = self.hook_q(attn_fn(hidden_state, self.W_Q, self.b_Q))
-        k = self.hook_k(attn_fn(hidden_state, self.W_K, self.b_K))    
-        v = self.hook_v(attn_fn(hidden_state, self.W_V, self.b_V))
+        q = self.hook_q(attn_fn(hidden_states, self.W_Q, self.b_Q))
+        k = self.hook_k(attn_fn(hidden_states, self.W_K, self.b_K))
+        v = self.hook_v(attn_fn(hidden_states, self.W_V, self.b_V))
         # import pdb
         # pdb.set_trace()
         
         
-        if past_kv_cache_entry is not None:
-            # Appends the new keys and values to the cached values, and automatically updates the cache
-            kv_cache_pos_offset = past_kv_cache_entry.past_keys.size(1)
-            k, v = past_kv_cache_entry.append(k, v)
+        if past_key_value is not None:
+        # Append new keys and values to the cache and update the cache
+            kv_cache_pos_offset = past_key_value.past_keys.size(1)
+            updated_keys, updated_values = past_key_value.append(k, v)
         else:
-            # Not using a cache
             kv_cache_pos_offset = 0
+            # Initialize past_key_value
+            past_key_value = HookedTransformerKeyValueCacheEntry(
+                past_keys=k,
+                past_values=v,
+                frozen=False
+            )
+            updated_keys, updated_values = k, v
+            
+        k = updated_keys
+        v = updated_values
         # if self.cfg.positional_embedding_type == "rotary":
         #     q = self.hook_rot_q(self.apply_rotary(q, kv_cache_pos_offset, attention_mask))
         #     k = self.hook_rot_k(
@@ -297,9 +299,15 @@ class MistralAttention(AbstractAttention):
         q=q.transpose(1, 2).contiguous()
         k=k.transpose(1, 2).contiguous()
         v=v.transpose(1, 2).contiguous()
-        position_ids = torch.arange(0,hidden_state.size(1),device=hidden_state.device).unsqueeze(0)
-        cos,sin=self.rotary_emb(v,position_ids)
-        q,k=apply_rotary_pos_emb(q,k,cos,sin,position_ids)
+        if self.cfg.positional_embedding_type == "rotary":
+            if position_ids is None:
+                position_ids = torch.arange(
+                    kv_cache_pos_offset,
+                    kv_cache_pos_offset + hidden_states.size(1),
+                    device=hidden_states.device
+                ).unsqueeze(0)
+            cos, sin = self.rotary_emb(v, position_ids)
+            q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
 
         if self.cfg.dtype not in [torch.float32, torch.float64]:
             # If using 16 bits, increase the precision to avoid numerical instabilities
@@ -314,92 +322,31 @@ class MistralAttention(AbstractAttention):
         # k_ = einops.rearrange(
         #     k, "batch key_pos head_index d_head -> batch head_index d_head key_pos"
         # )
-        attn_scores = torch.matmul(q,k.transpose(2,3)) /math.sqrt(self.cfg.d_head)
-        # attn_scores = self.calculate_attention_scores(
-        #     q, k
-        # )  # [batch, head_index, query_pos, key_pos]
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.cfg.d_head)  # [batch, if attention_mask is not None:
+            # Expand attention_mask to match attn_scores dimensions
+        if attention_mask is not None:
+            attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)  # [batch, 1, 1, seq_len_total]
+            attn_scores = attn_scores.masked_fill(attention_mask == 0, float('-inf'))
 
-        # if self.cfg.positional_embedding_type == "alibi":
-        #     query_ctx = attn_scores.size(-2)
-        #     # The key context length is the number of positions in the past - this includes all positions in the cache
-        #     key_ctx = attn_scores.size(-1)
-
-        #     # only recompute when necessary to increase efficiency.
-        #     if self.alibi is None or key_ctx > self.alibi.size(-1):
-        #         self.alibi = AbstractAttention.create_alibi_bias(
-        #             self.cfg.n_heads, key_ctx, self.cfg.device
-        #         )
-
-        #     attn_scores += self.alibi[
-        #         :, :query_ctx, :key_ctx
-        #     ]  # [batch, head_index, query_pos, key_pos]
-        # elif self.cfg.positional_embedding_type == "relative_positional_bias":
-        #     if position_bias is None:
-        #         if self.has_relative_attention_bias:
-        #             raise ValueError("Positional bias is required for relative_positional_bias")
-        #         else:
-        #             position_bias = torch.zeros(
-        #                 1,
-        #                 self.cfg.n_heads,
-        #                 attn_scores.shape[2],
-        #                 attn_scores.shape[3],
-        #                 device=attn_scores.device,
-        #             )
-
-        #     attn_scores += position_bias
-        if self.cfg.attention_dir == "causal":
-            # If causal attention, we mask it to only attend backwards. If bidirectional, we don't mask.
-            attn_scores = self.apply_causal_mask(
-                attn_scores, kv_cache_pos_offset, attention_mask
-            )  # [batch, head_index, query_pos, key_pos]
-        if additive_attention_mask is not None:
-            attn_scores += additive_attention_mask
-
+        # Apply hooks to attention scores
         attn_scores = self.hook_attn_scores(attn_scores)
-        pattern = F.softmax(attn_scores, dim=-1)
-        pattern = torch.where(torch.isnan(pattern), torch.zeros_like(pattern), pattern)
-        pattern = self.hook_pattern(pattern)  # [batch, head_index, query_pos, key_pos]
-        pattern = pattern.to(self.cfg.dtype)
-        pattern = pattern.to(v.device)
-        # v_ = einops.rearrange(
-        #     v, "batch key_pos head_index d_head -> batch head_index key_pos d_head"
-        # )
-        # pattern_ = einops.rearrange(
-        #     pattern,
-        #     "batch head_index query_pos key_pos -> batch head_index query_pos key_pos",
-        # )
-        # z = self.hook_z(torch.matmul(pattern_,v_))
-        # z=  self.hook_z(einops.rearrange(
-        #        torch.matmul(pattern_,v_),
-        #         "batch head_index query_pos d_head -> batch query_pos head_index d_head",
-        # ))
-        z=torch.matmul(pattern,v)
-        z=self.hook_z(z.transpose(1, 2).contiguous())
-        z = z.reshape(z.shape[0], z.shape[1], self.cfg.d_head * self.cfg.n_heads).contiguous()
-        # if not self.cfg.use_attn_result:
-        # device = self.W_O.device
-        w = einops.rearrange(self.W_O, "head_index d_head d_model -> (head_index d_head) d_model ").contiguous()
-        w=w.transpose(0,1).contiguous()
-        #einops.rearrange(self.W_O, "head_index d_head d_model -> (head_index d_head) d_model ").contiguous()
-        self.o_proj.weight = nn.Parameter(w)
-        out = self.o_proj(z)
-               
-        # else:
-        #     # Explicitly calculate the attention result so it can be accessed by a hook
-        #     # This is off by default because it can easily eat through your GPU memory.
-        #     w = einops.rearrange(
-        #         self.W_O,
-        #         "head_index d_head d_model -> d_model head_index d_head",
-        #     )
-        #     result = self.hook_result(
-        #         einops.einsum(
-        #             z,
-        #             w,
-        #             "... head_index d_head, d_model head_index d_head -> ... head_index d_model",
-        #         )
-        #     )  # [batch, pos, head_index, d_model]
-        #     out = (
-        #         einops.reduce(result, "batch position index model->batch position model", "sum")
-        #         + self.b_O
-        #     )  # [batch, pos, d_model]
-        return out
+
+        # Compute attention probabilities (patterns)
+        attn_probs = F.softmax(attn_scores, dim=-1)
+        attn_probs = torch.where(torch.isnan(attn_probs), torch.zeros_like(attn_probs), attn_probs)
+        attn_probs = self.hook_pattern(attn_probs)
+        attn_probs = attn_probs.to(self.cfg.dtype)
+        attn_probs = attn_probs.to(v.device)
+
+        # Compute attention output
+        attn_output = torch.matmul(attn_probs, v)  # [batch, num_heads, seq_len, d_head]
+        attn_output = attn_output.transpose(1, 2).contiguous()  # [batch, seq_len, num_heads, d_head]
+        attn_output = attn_output.reshape(
+            attn_output.size(0), attn_output.size(1), self.cfg.d_model
+        ).contiguous()  # [batch, seq_len, d_model]
+        attn_output = self.hook_z(attn_output)
+
+        # Apply the output projection
+        out = self.o_proj(attn_output)  # [batch, seq_len, d_model]
+
+        return out,past_key_value

@@ -10,8 +10,8 @@ from transformers import (
 )
 sys.path.append('/aifs4su/yaodong/changye/TransformerLens')
 from transformer_lens.HookedLlava import HookedLlava
-# import pdb
-# pdb.set_trace()
+import pdb
+pdb.set_trace()
 MODEL_PATH = "llava-hf/llava-v1.6-mistral-7b-hf"
 
 def load_models_and_processor(model_path):
@@ -140,8 +140,8 @@ def main():
     image_path = "/aifs4su/yaodong/changye/TransformerLens/IMG_20230213_181559.jpg"
     inputs = process_image_and_generate_response(processor, vision_model, image_path)
     # outputs = hook_language_model.generate(inputs)
-    import pdb
-    pdb.set_trace()
+    # import pdb
+    # pdb.set_trace()
     output = vision_model.generate(**inputs,max_new_tokens=100)
     
     print(processor.decode(output[0], skip_special_tokens=True))

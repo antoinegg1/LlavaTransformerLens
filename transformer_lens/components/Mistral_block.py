@@ -86,7 +86,7 @@ class MistralBlock(TransformerBlock):
             self.attn = attention(self.cfg, attn_type, block_index)
         if not self.cfg.attn_only:
             self.mlp = MLPFactory.create_mlp(self.cfg)
-
+        self.updated_past_key_value=None
         self.hook_attn_in = HookPoint()  # [batch, pos, n_heads, d_model]
         self.hook_q_input = HookPoint()  # [batch, pos, n_heads, d_model]
         self.hook_k_input = HookPoint()  # [batch, pos, n_heads, d_model]
@@ -103,37 +103,31 @@ class MistralBlock(TransformerBlock):
         
     def forward(
         self,
-        resid_pre: Float[torch.Tensor, "batch pos d_model"],
-        shortformer_pos_embed: Optional[Float[torch.Tensor, "batch pos d_model"]] = None,
-        past_kv_cache_entry: Optional[HookedTransformerKeyValueCacheEntry] = None,
-        attention_mask: Optional[Int[torch.Tensor, "batch offset_pos"]] = None,
-    ) -> Float[torch.Tensor, "batch pos d_model"]:
-        """A single Transformer block.
+        hidden_states: torch.Tensor,  # [batch, seq_len, d_model]
+        position_ids: Optional[torch.Tensor] = None,  # [batch, seq_len]
+        attention_mask: Optional[torch.Tensor] = None,  # [batch, seq_len]
+        past_key_value: Optional[HookedTransformerKeyValueCacheEntry] = None,  # Cache entry for past key/value states
+    ) -> torch.Tensor:  # [batch, seq_len, d_model]
+        # hidden_states = block(
+        #         hidden_states,
+        #         attention_mask=attention_mask,
+        #         past_key_value=past_key_value,
+        #     )
+        hidden_states = self.hook_resid_pre(hidden_states)  # [batch, pos, d_model]
 
-        Args:
-            resid_pre (torch.Tensor): The residual stream - shape [batch, pos, d_model]
-            cache (HookedTransformerKeyValueCache): A cache of previous keys and values, used only when generating text. Defaults to None.
-            shortformer_pos_embed (torch.Tensor, optional): Only used for positional_embeddings_type == "shortformer". The positional embeddings. See HookedTransformerConfig for details. Defaults to None.
-            attention_mask (torch.Tensor, optional): The attention mask for padded tokens. Defaults to None.
+        # if self.cfg.use_attn_in or self.cfg.use_split_qkv_input:
+        #     # We're adding a head dimension
+        #     if shortformer_pos_embed is not None:
+        #         shortformer_pos_embed = repeat_along_head_dimension(
+        #             shortformer_pos_embed, n_heads=self.cfg.n_heads
+        #         )
+        # else:
+        #     attn_in = hidden_states
 
-        Returns:
-            Float[torch.Tensor, "batch pos d_model"]: Our resulting tensor
-        """
-        resid_pre = self.hook_resid_pre(resid_pre)  # [batch, pos, d_model]
-
-        if self.cfg.use_attn_in or self.cfg.use_split_qkv_input:
-            # We're adding a head dimension
-            if shortformer_pos_embed is not None:
-                shortformer_pos_embed = repeat_along_head_dimension(
-                    shortformer_pos_embed, n_heads=self.cfg.n_heads
-                )
-        else:
-            attn_in = resid_pre
-
-        if self.cfg.use_attn_in:
-            attn_in = self.hook_attn_in(
-                repeat_along_head_dimension(resid_pre, n_heads=self.cfg.n_heads)
-            )
+        # if self.cfg.use_attn_in:
+        #     attn_in = self.hook_attn_in(
+        #         repeat_along_head_dimension(resid_pre, n_heads=self.cfg.n_heads)
+        #     )
 
         # if self.cfg.use_split_qkv_input:
         #     n_kv_heads = (
@@ -155,43 +149,36 @@ class MistralBlock(TransformerBlock):
         #     key_input = attn_in
         #     value_input = attn_in
         # import pdb; pdb.set_trace()
-        hidden_state=self.ln1(attn_in)
-        
-        
-        attn_out = (
-            # hook the residual stream states that are used to calculate the
-            # queries, keys and values, independently.
-            # Then take the layer norm of these inputs, and pass these to the attention module.
-            self.attn(
-                hidden_state,
-                past_kv_cache_entry=past_kv_cache_entry,
-                attention_mask=attention_mask,
-            )
-        )  # [batch, pos, d_model]
+        normed_hidden_states = self.ln1(hidden_states)
+        attn_out, updated_past_key_value = self.attn(
+            hidden_states=normed_hidden_states,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            past_key_value=past_key_value,
+        )  # [batch, seq_len, d_model]
+        self.updated_past_key_value = updated_past_key_value
+        # attn_out = (
+        #     # hook the residual stream states that are used to calculate the
+        #     # queries, keys and values, independently.
+        #     # Then take the layer norm of these inputs, and pass these to the attention module.
+        #     self.attn(
+        #         hidden_state,
+        #         past_kv_cache_entry=past_kv_cache_entry,
+        #         attention_mask=attention_mask,
+        #     )
+        # )  # [batch, pos, d_model]
         if self.cfg.use_normalization_before_and_after:
             # If we use LayerNorm both before and after, then apply the second LN after the layer
             # and before the hook. We do it before the hook so hook_attn_out captures "that which
             # is added to the residual stream"
             attn_out = self.ln1_post(attn_out)
         attn_out = self.hook_attn_out(attn_out)
-        if not self.cfg.attn_only and not self.cfg.parallel_attn_mlp:
-            resid_mid = self.hook_resid_mid(resid_pre + attn_out)  # [batch, pos, d_model]
-            mlp_in = (
-                resid_mid if not self.cfg.use_hook_mlp_in else self.hook_mlp_in(resid_mid.clone())
-            )
-            normalized_resid_mid = self.ln2(mlp_in)
-            mlp_out = self.apply_mlp(normalized_resid_mid)
-            resid_post = self.hook_resid_post(resid_mid + mlp_out)  # [batch, pos, d_model]
-        elif self.cfg.parallel_attn_mlp:
-            # Dumb thing done by GPT-J, both MLP and Attn read from resid_pre and write to resid_post, no resid_mid used.
-            # In GPT-J, LN1 and LN2 are tied, in GPT-NeoX they aren't.
-            normalized_resid_pre_2 = self.ln2(
-                resid_pre if not self.cfg.use_hook_mlp_in else self.hook_mlp_in(resid_pre.clone())
-            )
-            mlp_out = self.apply_mlp(normalized_resid_pre_2)
-            resid_post = self.hook_resid_post(
-                resid_pre + attn_out + mlp_out
-            )  # [batch, pos, d_model]
+        resid_mid = self.hook_resid_mid(hidden_states + attn_out)
+        if not self.cfg.attn_only:
+            normed_resid_mid = self.ln2(resid_mid)
+            mlp_out = self.apply_mlp(normed_resid_mid)  # [batch, seq_len, d_model]
+            resid_post = self.hook_resid_post(resid_mid + mlp_out)  # [batch, seq_len, d_model]
         else:
-            resid_post = self.hook_resid_post(resid_pre + attn_out)  # [batch, pos, d_model]
-        return resid_post
+            resid_post = self.hook_resid_post(resid_mid)  # [batch, seq_len, d_model]
+
+        return resid_post  # [batch, pos, d_model]
